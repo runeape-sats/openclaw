@@ -1,3 +1,4 @@
+import type { SsrFPolicy } from "../infra/net/ssrf.js";
 import { fetchWithSsrFGuard } from "../infra/net/fetch-guard.js";
 import { logWarn } from "../logger.js";
 
@@ -52,6 +53,7 @@ export type InputPdfLimits = {
 
 export type InputFileLimits = {
   allowUrl: boolean;
+  urlAllowlist?: string[];
   allowedMimes: Set<string>;
   maxBytes: number;
   maxChars: number;
@@ -62,6 +64,7 @@ export type InputFileLimits = {
 
 export type InputImageLimits = {
   allowUrl: boolean;
+  urlAllowlist?: string[];
   allowedMimes: Set<string>;
   maxBytes: number;
   maxRedirects: number;
@@ -107,6 +110,29 @@ export const DEFAULT_INPUT_PDF_MAX_PAGES = 4;
 export const DEFAULT_INPUT_PDF_MAX_PIXELS = 4_000_000;
 export const DEFAULT_INPUT_PDF_MIN_TEXT_CHARS = 200;
 
+function estimateBase64DecodedBytes(base64: string): number {
+  const cleaned = base64.trim().replace(/\s+/g, "");
+  if (!cleaned) {
+    return 0;
+  }
+  const padding = cleaned.endsWith("==") ? 2 : cleaned.endsWith("=") ? 1 : 0;
+  const estimated = Math.floor((cleaned.length * 3) / 4) - padding;
+  return Math.max(0, estimated);
+}
+
+function rejectOversizedBase64Payload(params: {
+  data: string;
+  maxBytes: number;
+  label: "Image" | "File";
+}): void {
+  const estimated = estimateBase64DecodedBytes(params.data);
+  if (estimated > params.maxBytes) {
+    throw new Error(
+      `${params.label} too large: ${estimated} bytes (limit: ${params.maxBytes} bytes)`,
+    );
+  }
+}
+
 export function normalizeMimeType(value: string | undefined): string | undefined {
   if (!value) {
     return undefined;
@@ -141,11 +167,15 @@ export async function fetchWithGuard(params: {
   maxBytes: number;
   timeoutMs: number;
   maxRedirects: number;
+  policy?: SsrFPolicy;
+  auditContext?: string;
 }): Promise<InputFetchResult> {
   const { response, release } = await fetchWithSsrFGuard({
     url: params.url,
     maxRedirects: params.maxRedirects,
     timeoutMs: params.timeoutMs,
+    policy: params.policy,
+    auditContext: params.auditContext,
     init: { headers: { "User-Agent": "OpenClaw-Gateway/1.0" } },
   });
 
@@ -156,18 +186,13 @@ export async function fetchWithGuard(params: {
 
     const contentLength = response.headers.get("content-length");
     if (contentLength) {
-      const size = parseInt(contentLength, 10);
-      if (size > params.maxBytes) {
+      const size = Number(contentLength);
+      if (Number.isFinite(size) && size > params.maxBytes) {
         throw new Error(`Content too large: ${size} bytes (limit: ${params.maxBytes} bytes)`);
       }
     }
 
-    const buffer = Buffer.from(await response.arrayBuffer());
-    if (buffer.byteLength > params.maxBytes) {
-      throw new Error(
-        `Content too large: ${buffer.byteLength} bytes (limit: ${params.maxBytes} bytes)`,
-      );
-    }
+    const buffer = await readResponseWithLimit(response, params.maxBytes);
 
     const contentType = response.headers.get("content-type") || undefined;
     const parsed = parseContentType(contentType);
@@ -176,6 +201,48 @@ export async function fetchWithGuard(params: {
   } finally {
     await release();
   }
+}
+
+async function readResponseWithLimit(res: Response, maxBytes: number): Promise<Buffer> {
+  const body = res.body;
+  if (!body || typeof body.getReader !== "function") {
+    const fallback = Buffer.from(await res.arrayBuffer());
+    if (fallback.byteLength > maxBytes) {
+      throw new Error(`Content too large: ${fallback.byteLength} bytes (limit: ${maxBytes} bytes)`);
+    }
+    return fallback;
+  }
+
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      if (value?.length) {
+        total += value.length;
+        if (total > maxBytes) {
+          try {
+            await reader.cancel();
+          } catch {}
+          throw new Error(`Content too large: ${total} bytes (limit: ${maxBytes} bytes)`);
+        }
+        chunks.push(value);
+      }
+    }
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {}
+  }
+
+  return Buffer.concat(
+    chunks.map((chunk) => Buffer.from(chunk)),
+    total,
+  );
 }
 
 function decodeTextContent(buffer: Buffer, charset: string | undefined): string {
@@ -261,6 +328,7 @@ export async function extractImageContentFromSource(
     if (!source.data) {
       throw new Error("input_image base64 source missing 'data' field");
     }
+    rejectOversizedBase64Payload({ data: source.data, maxBytes: limits.maxBytes, label: "Image" });
     const mimeType = normalizeMimeType(source.mediaType) ?? "image/png";
     if (!limits.allowedMimes.has(mimeType)) {
       throw new Error(`Unsupported image MIME type: ${mimeType}`);
@@ -283,6 +351,11 @@ export async function extractImageContentFromSource(
       maxBytes: limits.maxBytes,
       timeoutMs: limits.timeoutMs,
       maxRedirects: limits.maxRedirects,
+      policy: {
+        allowPrivateNetwork: false,
+        hostnameAllowlist: limits.urlAllowlist,
+      },
+      auditContext: "openresponses.input_image",
     });
     if (!limits.allowedMimes.has(result.mimeType)) {
       throw new Error(`Unsupported image MIME type from URL: ${result.mimeType}`);
@@ -308,6 +381,7 @@ export async function extractFileContentFromSource(params: {
     if (!source.data) {
       throw new Error("input_file base64 source missing 'data' field");
     }
+    rejectOversizedBase64Payload({ data: source.data, maxBytes: limits.maxBytes, label: "File" });
     const parsed = parseContentType(source.mediaType);
     mimeType = parsed.mimeType;
     charset = parsed.charset;
@@ -321,6 +395,11 @@ export async function extractFileContentFromSource(params: {
       maxBytes: limits.maxBytes,
       timeoutMs: limits.timeoutMs,
       maxRedirects: limits.maxRedirects,
+      policy: {
+        allowPrivateNetwork: false,
+        hostnameAllowlist: limits.urlAllowlist,
+      },
+      auditContext: "openresponses.input_file",
     });
     const parsed = parseContentType(result.contentType);
     mimeType = parsed.mimeType ?? normalizeMimeType(result.mimeType);
