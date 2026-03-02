@@ -50,10 +50,22 @@ const MISSING_CONFIG_MAX_RETRIES = 2;
 const BASE_RELOAD_RULES: ReloadRule[] = [
   { prefix: "gateway.remote", kind: "none" },
   { prefix: "gateway.reload", kind: "none" },
+  // Stuck-session warning threshold is read by the diagnostics heartbeat loop.
+  { prefix: "diagnostics.stuckSessionWarnMs", kind: "none" },
   { prefix: "hooks.gmail", kind: "hot", actions: ["restart-gmail-watcher"] },
   { prefix: "hooks", kind: "hot", actions: ["reload-hooks"] },
   {
     prefix: "agents.defaults.heartbeat",
+    kind: "hot",
+    actions: ["restart-heartbeat"],
+  },
+  {
+    prefix: "agents.defaults.model",
+    kind: "hot",
+    actions: ["restart-heartbeat"],
+  },
+  {
+    prefix: "models",
     kind: "hot",
     actions: ["restart-heartbeat"],
   },
@@ -71,7 +83,6 @@ const BASE_RELOAD_RULES_TAIL: ReloadRule[] = [
   { prefix: "identity", kind: "none" },
   { prefix: "wizard", kind: "none" },
   { prefix: "logging", kind: "none" },
-  { prefix: "models", kind: "none" },
   { prefix: "agents", kind: "none" },
   { prefix: "tools", kind: "none" },
   { prefix: "bindings", kind: "none" },
@@ -82,6 +93,7 @@ const BASE_RELOAD_RULES_TAIL: ReloadRule[] = [
   { prefix: "session", kind: "none" },
   { prefix: "talk", kind: "none" },
   { prefix: "skills", kind: "none" },
+  { prefix: "secrets", kind: "none" },
   { prefix: "plugins", kind: "restart" },
   { prefix: "ui", kind: "none" },
   { prefix: "gateway", kind: "restart" },
@@ -255,7 +267,7 @@ export function startGatewayConfigReloader(opts: {
   initialConfig: OpenClawConfig;
   readSnapshot: () => Promise<ConfigFileSnapshot>;
   onHotReload: (plan: GatewayReloadPlan, nextConfig: OpenClawConfig) => Promise<void>;
-  onRestart: (plan: GatewayReloadPlan, nextConfig: OpenClawConfig) => void;
+  onRestart: (plan: GatewayReloadPlan, nextConfig: OpenClawConfig) => void | Promise<void>;
   log: {
     info: (msg: string) => void;
     warn: (msg: string) => void;
@@ -291,7 +303,16 @@ export function startGatewayConfigReloader(opts: {
       return;
     }
     restartQueued = true;
-    opts.onRestart(plan, nextConfig);
+    void (async () => {
+      try {
+        await opts.onRestart(plan, nextConfig);
+      } catch (err) {
+        // Restart checks can fail (for example unresolved SecretRefs). Keep the
+        // reloader alive and allow a future change to retry restart scheduling.
+        restartQueued = false;
+        opts.log.error(`config restart failed: ${String(err)}`);
+      }
+    })();
   };
 
   const handleMissingSnapshot = (snapshot: ConfigFileSnapshot): boolean => {
